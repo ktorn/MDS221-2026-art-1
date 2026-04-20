@@ -21,19 +21,16 @@ let autoDriftPhase = 0;
 let esp32Endpoint = "http://192.168.1.200/imu";
 let lastSensorPoll = 0;
 const SENSOR_POLL_MS = 50;
+const BASE_OVERSCAN = 1.35;
 
 function preload() {
   sourcePainting = loadImage("./assets/source-painting.png");
 }
 
 function setup() {
-  const canvas = createCanvas(900, 900);
+  const canvas = createCanvas(windowWidth, windowHeight);
   canvas.parent("canvas-container");
-
-  baseLayer = createGraphics(width, height);
-  spiralLayer = createGraphics(width, height);
-  spiralTempLayer = createGraphics(width, height);
-  smudgeLayer = createGraphics(width, height);
+  rebuildLayers();
 }
 
 function draw() {
@@ -44,6 +41,18 @@ function draw() {
   applyTiltSmudge();
   applyVerticalSliceDrift();
   drawDebugInfo();
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  rebuildLayers();
+}
+
+function rebuildLayers() {
+  baseLayer = createGraphics(width, height);
+  spiralLayer = createGraphics(width, height);
+  spiralTempLayer = createGraphics(width, height);
+  smudgeLayer = createGraphics(width, height);
 }
 
 function updateSensorState() {
@@ -108,6 +117,13 @@ function renderBasePainting() {
     drawY = (height - drawH) * 0.5;
   }
 
+  // Overscan keeps extra pixels outside the viewport so strong warps
+  // still reveal image content instead of black/transparent edges.
+  drawW *= BASE_OVERSCAN;
+  drawH *= BASE_OVERSCAN;
+  drawX = (width - drawW) * 0.5;
+  drawY = (height - drawH) * 0.5;
+
   baseLayer.image(sourcePainting, drawX, drawY, drawW, drawH);
   baseLayer.pop();
 }
@@ -120,6 +136,7 @@ function applySpiralWarp() {
   const cy = height * 0.5;
 
   spiralLayer.clear();
+  spiralLayer.image(baseLayer, 0, 0);
 
   for (let y = 0; y < height; y += rowStep) {
     const normY = (y - cy) / height;
@@ -130,6 +147,7 @@ function applySpiralWarp() {
   spiralTempLayer.clear();
   spiralTempLayer.image(spiralLayer, 0, 0);
   spiralLayer.clear();
+  spiralLayer.image(spiralTempLayer, 0, 0);
 
   for (let x = 0; x < width; x += colStep) {
     const normX = (x - cx) / width;
@@ -177,7 +195,10 @@ function applyVerticalSliceDrift() {
   for (let i = 0; i < slices; i++) {
     const sx = i * sliceWidth;
     const wobble = sin(frameCount * 0.07 + i * 0.72) * driftAmp;
+    // Tile each slice vertically to avoid exposing black gaps when offsetting.
+    image(smudgeLayer, sx, wobble - height, sliceWidth + 1, height, sx, 0, sliceWidth + 1, height);
     image(smudgeLayer, sx, wobble, sliceWidth + 1, height, sx, 0, sliceWidth + 1, height);
+    image(smudgeLayer, sx, wobble + height, sliceWidth + 1, height, sx, 0, sliceWidth + 1, height);
   }
 }
 

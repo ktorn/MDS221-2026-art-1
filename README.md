@@ -15,6 +15,9 @@ Interactive artwork prototype with:
 ## Run the artwork (mock mode)
 
 1. Open a local static server in `p5js`.
+   - From any location (Windows PowerShell):
+     - `cd E:\mds221\MDS221-2026-art-1`
+     - `cd .\p5js`
    - If Python is available: `python -m http.server 8080`
    - If Python is NOT available (Windows PowerShell): `powershell -ExecutionPolicy Bypass -File .\serve.ps1 -Port 8080`
 2. Open `http://localhost:8080`.
