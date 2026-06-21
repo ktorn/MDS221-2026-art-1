@@ -17,10 +17,180 @@ const mockTargets = {
 };
 
 let useMockSensor = true;
+let showDebugPanes = false;
 let autoDriftPhase = 0;
-let esp32Endpoint = "http://192.168.1.200/imu";
-let lastSensorPoll = 0;
-const SENSOR_POLL_MS = 50;
+const IMU_STALE_MS = 500;
+
+const APP_SECRETS = window.APP_SECRETS || {};
+const REGISTRY_BASE_URL =
+  APP_SECRETS.registryBaseUrl || "https://esp-device-registry.xxx.workers.dev";
+const DEFAULT_DEVICE_ID = APP_SECRETS.deviceId || "MDS221-2026-1";
+
+function readUrlConfig() {
+  const params = new URLSearchParams(window.location.search);
+  return {
+    deviceId: params.get("deviceId") || DEFAULT_DEVICE_ID,
+    token: params.get("token") || APP_SECRETS.registryToken || null,
+    registry: params.get("registry") || REGISTRY_BASE_URL,
+    ws: params.get("ws"),
+    wsHost: params.get("wsHost"),
+    wsPort: params.get("wsPort") || "81"
+  };
+}
+
+function hasDirectWs(config) {
+  return !!(config.ws || config.wsHost);
+}
+
+function needsRegistryLookup(config) {
+  return !hasDirectWs(config) && !!(config.deviceId && config.token);
+}
+
+async function lookupDeviceEndpoint(config) {
+  const base = config.registry.replace(/\/$/, "");
+  const url = new URL(`${base}/lookup`);
+  url.searchParams.set("device_id", config.deviceId);
+  url.searchParams.set("token", config.token);
+
+  const res = await fetch(url.toString());
+  if (!res.ok) {
+    throw new Error(`lookup ${res.status}`);
+  }
+  const data = await res.json();
+  if (!data.lan_ip) throw new Error("no lan_ip");
+  const port = data.ws_port || 81;
+  return `ws://${data.lan_ip}:${port}`;
+}
+
+class ImuWebSocket {
+  constructor(url) {
+    this.url = url;
+    this.socket = null;
+    this.latest = null;
+    this.lastReceivedMs = 0;
+    this.errorState = null;
+    this.wantConnection = false;
+    this.reconnectTimer = null;
+  }
+
+  setUrl(url) {
+    const wasConnected = this.wantConnection;
+    this.disconnect();
+    this.url = url;
+    if (wasConnected) this.connect();
+  }
+
+  connect() {
+    this.wantConnection = true;
+    this.openSocket();
+  }
+
+  openSocket() {
+    if (this.socket && this.socket.readyState <= 1) return;
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    this.socket = new WebSocket(this.url);
+    this.errorState = null;
+    this.lastReceivedMs = 0;
+    this.latest = null;
+
+    this.socket.onclose = () => {
+      this.socket = null;
+      if (this.wantConnection) {
+        this.reconnectTimer = setTimeout(() => this.openSocket(), 2000);
+      }
+    };
+    this.socket.onerror = () => {
+      this.errorState = "error";
+    };
+    this.socket.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        if (
+          typeof payload.moveY !== "number" ||
+          typeof payload.rotation !== "number" ||
+          typeof payload.tilt !== "number"
+        ) {
+          return;
+        }
+        this.errorState = null;
+        this.lastReceivedMs = Date.now();
+        this.latest = {
+          moveY: constrain(payload.moveY, -1, 1),
+          rotation: constrain(payload.rotation, -1, 1),
+          tilt: constrain(payload.tilt, -1, 1)
+        };
+      } catch (err) {
+        this.errorState = "bad_data";
+      }
+    };
+  }
+
+  disconnect() {
+    this.wantConnection = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.socket) {
+      this.socket.close();
+      this.socket = null;
+    }
+    this.latest = null;
+    this.lastReceivedMs = 0;
+    this.errorState = null;
+  }
+
+  isStale() {
+    if (this.lastReceivedMs === 0) return true;
+    return Date.now() - this.lastReceivedMs > IMU_STALE_MS;
+  }
+
+  getState() {
+    if (!this.wantConnection) return "disconnected";
+    if (this.errorState) return this.errorState;
+    if (!this.socket) {
+      return this.reconnectTimer ? "reconnecting" : "disconnected";
+    }
+    const readyState = this.socket.readyState;
+    if (readyState === WebSocket.CONNECTING) return "connecting";
+    if (readyState === WebSocket.CLOSING) return "closing";
+    if (readyState === WebSocket.CLOSED) return "disconnected";
+    if (this.lastReceivedMs === 0) return "waiting";
+    if (this.isStale()) return "stale";
+    return "connected";
+  }
+
+  tick() {
+    if (!this.wantConnection) return;
+    const ageMs = this.lastReceivedMs === 0 ? null : Date.now() - this.lastReceivedMs;
+    if (
+      this.socket &&
+      this.socket.readyState === WebSocket.OPEN &&
+      ageMs !== null &&
+      ageMs > IMU_STALE_MS * 2
+    ) {
+      this.socket.close();
+    }
+  }
+}
+
+const URL_CONFIG = readUrlConfig();
+let wsUrl = hasDirectWs(URL_CONFIG)
+  ? URL_CONFIG.ws || `ws://${URL_CONFIG.wsHost}:${URL_CONFIG.wsPort}`
+  : needsRegistryLookup(URL_CONFIG)
+    ? "resolving…"
+    : "ws://localhost:8080";
+let registryState = needsRegistryLookup(URL_CONFIG)
+  ? "resolving"
+  : hasDirectWs(URL_CONFIG)
+    ? "bypassed"
+    : "no token";
+let imuInput;
 const BASE_OVERSCAN = 1.35;
 
 function preload() {
@@ -28,19 +198,44 @@ function preload() {
 }
 
 function setup() {
+  imuInput = new ImuWebSocket(wsUrl);
   const canvas = createCanvas(windowWidth, windowHeight);
   canvas.parent("canvas-container");
   rebuildLayers();
+  updateDebugPanesVisibility();
+
+  if (needsRegistryLookup(URL_CONFIG)) {
+    lookupDeviceEndpoint(URL_CONFIG)
+      .then((url) => {
+        wsUrl = url;
+        imuInput.setUrl(url);
+        registryState = "ok";
+        if (!useMockSensor) {
+          imuInput.connect();
+        }
+      })
+      .catch((err) => {
+        registryState = err.message || "failed";
+      });
+  } else if (hasDirectWs(URL_CONFIG) && !useMockSensor) {
+    registryState = "bypassed";
+    imuInput.connect();
+  }
 }
 
 function draw() {
   background(12);
+  if (!useMockSensor && imuInput) {
+    imuInput.tick();
+  }
   updateSensorState();
   renderBasePainting();
   applySpiralWarp();
   applyTiltSmudge();
   applyVerticalSliceDrift();
-  drawDebugInfo();
+  if (showDebugPanes) {
+    drawDebugInfo();
+  }
 }
 
 function windowResized() {
@@ -66,36 +261,14 @@ function updateSensorState() {
     sensor.moveY = lerp(sensor.moveY, constrain(mockTargets.moveY + idleMove, -1, 1), 0.1);
     sensor.rotation = lerp(sensor.rotation, constrain(mockTargets.rotation + idleRot, -1, 1), 0.1);
     sensor.tilt = lerp(sensor.tilt, constrain(mockTargets.tilt + idleTilt, -1, 1), 0.1);
-  } else {
-    pollEsp32Sensor();
+  } else if (imuInput) {
+    const frame = imuInput.latest;
+    if (frame && !imuInput.isStale()) {
+      sensor.moveY = lerp(sensor.moveY, frame.moveY, 0.2);
+      sensor.rotation = lerp(sensor.rotation, frame.rotation, 0.2);
+      sensor.tilt = lerp(sensor.tilt, frame.tilt, 0.2);
+    }
   }
-}
-
-function pollEsp32Sensor() {
-  const now = millis();
-  if (now - lastSensorPoll < SENSOR_POLL_MS) {
-    return;
-  }
-  lastSensorPoll = now;
-
-  fetch(esp32Endpoint)
-    .then((response) => {
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-      return response.json();
-    })
-    .then((data) => {
-      const nextMove = constrain(Number(data.moveY) || 0, -1, 1);
-      const nextRot = constrain(Number(data.rotation) || 0, -1, 1);
-      const nextTilt = constrain(Number(data.tilt) || 0, -1, 1);
-      sensor.moveY = lerp(sensor.moveY, nextMove, 0.2);
-      sensor.rotation = lerp(sensor.rotation, nextRot, 0.2);
-      sensor.tilt = lerp(sensor.tilt, nextTilt, 0.2);
-    })
-    .catch(() => {
-      // Keep previous values on network dropouts.
-    });
 }
 
 function renderBasePainting() {
@@ -228,24 +401,44 @@ function keyPressed() {
   }
   if (key === "m" || key === "M") {
     useMockSensor = !useMockSensor;
+    if (imuInput) {
+      if (useMockSensor) {
+        imuInput.disconnect();
+      } else {
+        imuInput.connect();
+      }
+    }
+  }
+  if (key === "b" || key === "B") {
+    showDebugPanes = !showDebugPanes;
+    updateDebugPanesVisibility();
+  }
+}
+
+function updateDebugPanesVisibility() {
+  const hud = document.querySelector(".hud");
+  if (hud) {
+    hud.style.display = showDebugPanes ? "" : "none";
   }
 }
 
 function drawDebugInfo() {
-  const panelHeight = useMockSensor ? 76 : 96;
+  const panelHeight = useMockSensor ? 76 : 112;
   const panelTop = height - (panelHeight + 12);
   push();
   fill(0, 180);
   noStroke();
-  rect(12, panelTop, 480, panelHeight, 8);
+  rect(12, panelTop, 520, panelHeight, 8);
   fill(255);
   textSize(14);
   text(`Mock sensor: ${useMockSensor ? "ON" : "OFF"}`, 24, panelTop + 26);
   text(`moveY: ${nf(sensor.moveY, 1, 2)}`, 24, panelTop + 44);
   text(`rotation: ${nf(sensor.rotation, 1, 2)}`, 24, panelTop + 62);
   text(`tilt: ${nf(sensor.tilt, 1, 2)}`, 176, panelTop + 62);
-  if (!useMockSensor) {
-    text(`ESP32: ${esp32Endpoint}`, 24, panelTop + 82);
+  if (!useMockSensor && imuInput) {
+    text(`WS: ${imuInput.getState()}`, 24, panelTop + 82);
+    text(`Endpoint: ${wsUrl}`, 24, panelTop + 100);
+    text(`Registry: ${registryState}`, 320, panelTop + 82);
   }
   pop();
 }
