@@ -44,7 +44,7 @@
 #endif
 
 static const unsigned long REGISTER_INTERVAL_MS = 5UL * 60UL * 1000UL;
-static const unsigned long SENSOR_SEND_INTERVAL_MS = 50;
+static const unsigned long SENSOR_SEND_INTERVAL_MS = 100;
 static unsigned long gLastRegistryPostMs = 0;
 
 WebSocketsServer webSocket(81);

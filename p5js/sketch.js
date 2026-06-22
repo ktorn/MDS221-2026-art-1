@@ -16,10 +16,26 @@ const mockTargets = {
   tilt: 0
 };
 
-let useMockSensor = true;
 let showDebugPanes = false;
 let autoDriftPhase = 0;
-const IMU_STALE_MS = 500;
+const KEYBOARD_INACTIVITY_MS = 30000;
+const FPS_SAMPLE_MS = 500;
+const IMU_STALE_MS = 2000;
+const IMU_DISCONNECT_MS = 8000;
+const BASE_OVERSCAN = 1.35;
+const SMUDGE_SCALE = 0.5;
+const MAX_SMUDGE_STEPS = 8;
+const SMUDGE_TILT_THRESHOLD = 0.03;
+const IDLE_WAVE_SPEED = 0.007;
+const IDLE_WAVE_MOVE_AMP = 0.22;
+const IDLE_WAVE_ROT_AMP = 0.05;
+const REST_WAVE_MOVE_AMP = 0.04;
+const REST_WAVE_ROT_AMP = 0.015;
+let lastControlActivityMs = 0;
+let hasUserInteracted = false;
+let fpsDisplay = 0;
+let fpsFrameCount = 0;
+let fpsWindowStartMs = 0;
 
 const APP_SECRETS = window.APP_SECRETS || {};
 const REGISTRY_BASE_URL =
@@ -172,7 +188,7 @@ class ImuWebSocket {
       this.socket &&
       this.socket.readyState === WebSocket.OPEN &&
       ageMs !== null &&
-      ageMs > IMU_STALE_MS * 2
+      ageMs > IMU_DISCONNECT_MS
     ) {
       this.socket.close();
     }
@@ -191,18 +207,18 @@ let registryState = needsRegistryLookup(URL_CONFIG)
     ? "bypassed"
     : "no token";
 let imuInput;
-const BASE_OVERSCAN = 1.35;
 
 function preload() {
   sourcePainting = loadImage("./assets/source-painting.png");
 }
 
 function setup() {
+  lastControlActivityMs = millis();
   imuInput = new ImuWebSocket(wsUrl);
   const canvas = createCanvas(windowWidth, windowHeight);
   canvas.parent("canvas-container");
+  pixelDensity(1);
   rebuildLayers();
-  updateDebugPanesVisibility();
 
   if (needsRegistryLookup(URL_CONFIG)) {
     lookupDeviceEndpoint(URL_CONFIG)
@@ -210,22 +226,21 @@ function setup() {
         wsUrl = url;
         imuInput.setUrl(url);
         registryState = "ok";
-        if (!useMockSensor) {
-          imuInput.connect();
-        }
+        imuInput.connect();
       })
       .catch((err) => {
         registryState = err.message || "failed";
       });
-  } else if (hasDirectWs(URL_CONFIG) && !useMockSensor) {
+  } else if (hasDirectWs(URL_CONFIG)) {
     registryState = "bypassed";
     imuInput.connect();
   }
 }
 
 function draw() {
+  updateFps();
   background(12);
-  if (!useMockSensor && imuInput) {
+  if (isKeyboardControlActive() && imuInput) {
     imuInput.tick();
   }
   updateSensorState();
@@ -240,6 +255,7 @@ function draw() {
 
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
+  pixelDensity(1);
   rebuildLayers();
 }
 
@@ -247,28 +263,86 @@ function rebuildLayers() {
   baseLayer = createGraphics(width, height);
   spiralLayer = createGraphics(width, height);
   spiralTempLayer = createGraphics(width, height);
-  smudgeLayer = createGraphics(width, height);
+  smudgeLayer = createGraphics(ceil(width * SMUDGE_SCALE), ceil(height * SMUDGE_SCALE));
+}
+
+function markKeyboardActivity() {
+  hasUserInteracted = true;
+  lastControlActivityMs = millis();
+}
+
+function updateFps() {
+  const now = millis();
+  if (fpsWindowStartMs === 0) {
+    fpsWindowStartMs = now;
+    return;
+  }
+
+  fpsFrameCount++;
+  const elapsed = now - fpsWindowStartMs;
+  if (elapsed < FPS_SAMPLE_MS) return;
+
+  fpsDisplay = (fpsFrameCount * 1000) / elapsed;
+  fpsFrameCount = 0;
+  fpsWindowStartMs = now;
+}
+
+function isAutoModeActive() {
+  return millis() - lastControlActivityMs >= KEYBOARD_INACTIVITY_MS;
+}
+
+function isKeyboardControlActive() {
+  return hasUserInteracted && !isAutoModeActive();
+}
+
+function isAtRest() {
+  return !hasUserInteracted && !isAutoModeActive();
 }
 
 function updateSensorState() {
-  if (useMockSensor) {
-    autoDriftPhase += 0.012;
-    // Small idle movement keeps the artwork alive even without key input.
-    const idleMove = sin(autoDriftPhase) * 0.12;
-    const idleRot = cos(autoDriftPhase * 0.7) * 0.15;
-    const idleTilt = sin(autoDriftPhase * 0.5 + 1.8) * 0.1;
+  if (isAutoModeActive()) {
+    autoDriftPhase += IDLE_WAVE_SPEED;
+    const wave = sin(autoDriftPhase);
+    const ripple = sin(autoDriftPhase * 0.62 + 1.1);
 
-    sensor.moveY = lerp(sensor.moveY, constrain(mockTargets.moveY + idleMove, -1, 1), 0.1);
-    sensor.rotation = lerp(sensor.rotation, constrain(mockTargets.rotation + idleRot, -1, 1), 0.1);
-    sensor.tilt = lerp(sensor.tilt, constrain(mockTargets.tilt + idleTilt, -1, 1), 0.1);
-  } else if (imuInput) {
-    const frame = imuInput.latest;
-    if (frame && !imuInput.isStale()) {
-      sensor.moveY = lerp(sensor.moveY, frame.moveY, 0.2);
-      sensor.rotation = lerp(sensor.rotation, frame.rotation, 0.2);
-      sensor.tilt = lerp(sensor.tilt, frame.tilt, 0.2);
-    }
+    mockTargets.moveY = lerp(mockTargets.moveY, 0, 0.02);
+    mockTargets.rotation = lerp(mockTargets.rotation, 0, 0.02);
+    mockTargets.tilt = lerp(mockTargets.tilt, 0, 0.02);
+
+    const idleMoveY = wave * IDLE_WAVE_MOVE_AMP + ripple * 0.06;
+    const idleRot = sin(autoDriftPhase * 0.38) * IDLE_WAVE_ROT_AMP;
+
+    sensor.moveY = lerp(sensor.moveY, idleMoveY, 0.14);
+    sensor.rotation = lerp(sensor.rotation, idleRot, 0.1);
+    sensor.tilt = lerp(sensor.tilt, 0, 0.1);
+    return;
   }
+
+  if (isKeyboardControlActive()) {
+    if (imuInput) {
+      const frame = imuInput.latest;
+      if (frame && !imuInput.isStale()) {
+        sensor.moveY = lerp(sensor.moveY, frame.moveY, 0.2);
+        sensor.rotation = lerp(sensor.rotation, frame.rotation, 0.2);
+        sensor.tilt = lerp(sensor.tilt, frame.tilt, 0.2);
+        return;
+      }
+    }
+
+    sensor.moveY = lerp(sensor.moveY, mockTargets.moveY, 0.1);
+    sensor.rotation = lerp(sensor.rotation, mockTargets.rotation, 0.1);
+    sensor.tilt = lerp(sensor.tilt, mockTargets.tilt, 0.1);
+    return;
+  }
+
+  autoDriftPhase += IDLE_WAVE_SPEED * 0.7;
+  const wave = sin(autoDriftPhase);
+  const restMoveY = wave * REST_WAVE_MOVE_AMP;
+  const restRot = sin(autoDriftPhase * 0.38) * REST_WAVE_ROT_AMP;
+
+  sensor.moveY = lerp(sensor.moveY, restMoveY, 0.08);
+  sensor.rotation = lerp(sensor.rotation, restRot, 0.08);
+  sensor.tilt = lerp(sensor.tilt, 0, 0.08);
 }
 
 function renderBasePainting() {
@@ -341,19 +415,25 @@ function applySpiralWarp() {
 
 function applyTiltSmudge() {
   const tiltStrength = sensor.tilt;
-  const direction = Math.sign(tiltStrength) || 1;
-  const steps = floor(abs(tiltStrength) * 24);
-  const maxOffset = abs(tiltStrength) * 50;
-
   smudgeLayer.clear();
-  smudgeLayer.image(spiralLayer, 0, 0);
+
+  if (abs(tiltStrength) < SMUDGE_TILT_THRESHOLD) {
+    smudgeLayer.image(spiralLayer, 0, 0, smudgeLayer.width, smudgeLayer.height);
+    return;
+  }
+
+  const direction = Math.sign(tiltStrength) || 1;
+  const steps = max(1, floor(abs(tiltStrength) * MAX_SMUDGE_STEPS));
+  const maxOffset = abs(tiltStrength) * 50 * SMUDGE_SCALE;
+
+  smudgeLayer.image(spiralLayer, 0, 0, smudgeLayer.width, smudgeLayer.height);
 
   for (let i = 1; i <= steps; i++) {
-    const t = i / max(steps, 1);
+    const t = i / steps;
     const offset = direction * t * maxOffset;
-    const alpha = map(i, 1, max(steps, 1), 40, 4);
+    const alpha = map(i, 1, steps, 40, 4);
     smudgeLayer.tint(255, alpha);
-    smudgeLayer.image(spiralLayer, offset, 0);
+    smudgeLayer.image(spiralLayer, offset, 0, smudgeLayer.width, smudgeLayer.height);
   }
   smudgeLayer.noTint();
 }
@@ -362,80 +442,74 @@ function applyVerticalSliceDrift() {
   const slices = 42;
   const sliceWidth = width / slices;
   const driftAmp = sensor.moveY * 52;
+  const srcSliceWidth = (sliceWidth + 1) * SMUDGE_SCALE;
 
   imageMode(CORNER);
 
   for (let i = 0; i < slices; i++) {
     const sx = i * sliceWidth;
+    const srcX = sx * SMUDGE_SCALE;
     const wobble = sin(frameCount * 0.07 + i * 0.72) * driftAmp;
     // Tile each slice vertically to avoid exposing black gaps when offsetting.
-    image(smudgeLayer, sx, wobble - height, sliceWidth + 1, height, sx, 0, sliceWidth + 1, height);
-    image(smudgeLayer, sx, wobble, sliceWidth + 1, height, sx, 0, sliceWidth + 1, height);
-    image(smudgeLayer, sx, wobble + height, sliceWidth + 1, height, sx, 0, sliceWidth + 1, height);
+    image(smudgeLayer, sx, wobble - height, sliceWidth + 1, height, srcX, 0, srcSliceWidth, smudgeLayer.height);
+    image(smudgeLayer, sx, wobble, sliceWidth + 1, height, srcX, 0, srcSliceWidth, smudgeLayer.height);
+    image(smudgeLayer, sx, wobble + height, sliceWidth + 1, height, srcX, 0, srcSliceWidth, smudgeLayer.height);
   }
 }
 
 function keyPressed() {
   if (key === "w" || key === "W") {
+    markKeyboardActivity();
     mockTargets.moveY = constrain(mockTargets.moveY - 0.18, -1, 1);
   }
   if (key === "s" || key === "S") {
+    markKeyboardActivity();
     mockTargets.moveY = constrain(mockTargets.moveY + 0.18, -1, 1);
   }
   if (key === "q" || key === "Q") {
+    markKeyboardActivity();
     mockTargets.rotation = constrain(mockTargets.rotation - 0.18, -1, 1);
   }
   if (key === "e" || key === "E") {
+    markKeyboardActivity();
     mockTargets.rotation = constrain(mockTargets.rotation + 0.18, -1, 1);
   }
   if (key === "a" || key === "A") {
+    markKeyboardActivity();
     mockTargets.tilt = constrain(mockTargets.tilt - 0.18, -1, 1);
   }
   if (key === "d" || key === "D") {
+    markKeyboardActivity();
     mockTargets.tilt = constrain(mockTargets.tilt + 0.18, -1, 1);
   }
   if (key === "r" || key === "R") {
+    markKeyboardActivity();
     mockTargets.moveY = 0;
     mockTargets.rotation = 0;
     mockTargets.tilt = 0;
   }
-  if (key === "m" || key === "M") {
-    useMockSensor = !useMockSensor;
-    if (imuInput) {
-      if (useMockSensor) {
-        imuInput.disconnect();
-      } else {
-        imuInput.connect();
-      }
-    }
-  }
   if (key === "b" || key === "B") {
     showDebugPanes = !showDebugPanes;
-    updateDebugPanesVisibility();
-  }
-}
-
-function updateDebugPanesVisibility() {
-  const hud = document.querySelector(".hud");
-  if (hud) {
-    hud.style.display = showDebugPanes ? "" : "none";
   }
 }
 
 function drawDebugInfo() {
-  const panelHeight = useMockSensor ? 76 : 112;
+  const mode = isAutoModeActive() ? "auto" : isKeyboardControlActive() ? "keyboard" : "at rest";
+  const panelHeight = isKeyboardControlActive() ? 112 : 76;
   const panelTop = height - (panelHeight + 12);
+  const fpsLabel = fpsDisplay > 0 ? nf(fpsDisplay, 1, 1) : "--";
   push();
   fill(0, 180);
   noStroke();
   rect(12, panelTop, 520, panelHeight, 8);
   fill(255);
   textSize(14);
-  text(`Mock sensor: ${useMockSensor ? "ON" : "OFF"}`, 24, panelTop + 26);
+  text(`Mode: ${mode}`, 24, panelTop + 26);
+  text(`FPS: ${fpsLabel}`, 320, panelTop + 26);
   text(`moveY: ${nf(sensor.moveY, 1, 2)}`, 24, panelTop + 44);
   text(`rotation: ${nf(sensor.rotation, 1, 2)}`, 24, panelTop + 62);
   text(`tilt: ${nf(sensor.tilt, 1, 2)}`, 176, panelTop + 62);
-  if (!useMockSensor && imuInput) {
+  if (isKeyboardControlActive() && imuInput) {
     text(`WS: ${imuInput.getState()}`, 24, panelTop + 82);
     text(`Endpoint: ${wsUrl}`, 24, panelTop + 100);
     text(`Registry: ${registryState}`, 320, panelTop + 82);

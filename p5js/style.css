@@ -32,25 +32,3 @@ main {
   width: 100% !important;
   height: 100% !important;
 }
-
-.hud {
-  position: fixed;
-  top: 12px;
-  left: 12px;
-  z-index: 10;
-  width: min(900px, calc(100vw - 24px));
-  background: rgba(0, 0, 0, 0.45);
-  padding: 10px 12px;
-  border-radius: 8px;
-  pointer-events: none;
-}
-
-.hud h1 {
-  margin: 0 0 6px;
-  font-size: 1rem;
-}
-
-.hud p {
-  margin: 2px 0;
-  font-size: 0.92rem;
-}

@@ -1,0 +1,31 @@
+ARTWORK
+Light on the Wrong Path
+
+CREATOR
+Lu, Smile, Ruby
+
+NFT PLATFORM
+Teia.art
+
+BLOCKCHAIN
+Tezos
+
+DATE
+June 2026
+
+TAGS
+interactive, installation, usj, mds221, p5js, generative
+
+DESCRIPTION
+"Pioneers: Unlocking Life's Trajectory" – Using interaction to transform "overcoming life's obstacles" into a tangible, audible, and touchable artistic experience, helping you move from confusion to clarity.
+
+This is an interactive artwork. Use the keyboard to explore the painting:
+
+W/S — up/down drift
+Q/E — rotate (spiral warp)
+A/D — tilt (directional smudge)
+R — reset
+
+After 30 seconds without input, the piece enters a gentle auto-animation mode. Press any control key to interact again.
+
+Created by Lu, Smile, and Ruby as part of MDS221 – Interactive Multimedia Installation, University of Saint Joseph (USJ), Macau.
